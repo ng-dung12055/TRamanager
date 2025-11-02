@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Authorization;
 using TRManager.Api.Features.Auth.Dtos;
+using System.Linq;
+
 
 [ApiController]
 [Route("api/[controller]")]
@@ -31,4 +33,13 @@ public class AuthController : ControllerBase
         await _auth.LogoutAsync(refreshToken);
         return NoContent();
     }
+        [HttpGet("me")]
+    [Authorize]
+    public IActionResult Me()
+    {
+        var claims = User.Claims.ToDictionary(c => c.Type, c => c.Value);
+        return Ok(claims);
+    }
+
 }
+

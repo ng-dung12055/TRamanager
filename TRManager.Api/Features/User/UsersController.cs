@@ -6,7 +6,7 @@ namespace TRManager.Api.Features.User
 {
     [ApiController]
     [Route("api/[controller]")]
-    [Authorize]
+    [Authorize(Roles = "Admin")] // ⬅️ CHỈ Admin mới gọi được
     public class UsersController : ControllerBase
     {
         private readonly IUserService _users;
