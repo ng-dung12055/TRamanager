@@ -4,111 +4,133 @@ using TRManager.Api.Data;
 using TRManager.Api.Data.Entities;
 using TRManager.Api.Features.Auth.Dtos;
 
-public interface IAuthService
-{
-    Task<AuthResponse> RegisterAsync(RegisterRequest req);
-    Task<AuthResponse> LoginAsync(LoginRequest req, string? ip = null);
-    Task<AuthResponse> RefreshAsync(string refreshToken);
-    Task LogoutAsync(string refreshToken);
-}
+// ⚡ Alias để tránh trùng namespace TRManager.Api.Features.User
+using AppUser = TRManager.Api.Data.Entities.User;
+
+namespace TRManager.Api.Features.Auth;
 
 public class AuthService : IAuthService
 {
     private readonly ApplicationDbContext _db;
-    private readonly IPasswordHasher<User> _hasher;
+    private readonly IPasswordHasher<AppUser> _hasher;
     private readonly IJwtTokenGenerator _jwt;
-    private readonly IConfiguration _config;
 
-    public AuthService(ApplicationDbContext db, IPasswordHasher<User> hasher, IJwtTokenGenerator jwt, IConfiguration config)
+    public AuthService(
+        ApplicationDbContext db,
+        IPasswordHasher<AppUser> hasher,
+        IJwtTokenGenerator jwt)
     {
-        _db = db; _hasher = hasher; _jwt = jwt; _config = config;
+        _db = db;
+        _hasher = hasher;
+        _jwt = jwt;
     }
 
-    public async Task<AuthResponse> RegisterAsync(RegisterRequest req)
+    // ---------- Đăng ký ----------
+    public async Task<AuthResponse> RegisterAsync(RegisterRequest req, string? ip = null)
     {
-        if (await _db.Users.AnyAsync(x => x.Email == req.Email))
-            throw new InvalidOperationException("Email already exists.");
+        if (await _db.Users.AnyAsync(u => u.Email == req.Email))
+            throw new InvalidOperationException("Email đã tồn tại.");
 
-        var user = new User
+        // Gán mặc định role = Tenant nếu không có
+        var defaultRoleName = string.IsNullOrWhiteSpace(req.Role) ? "Tenant" : req.Role!;
+        var role = await _db.Roles.FirstOrDefaultAsync(r => r.Name == defaultRoleName);
+        if (role == null)
+        {
+            role = new Role { Name = defaultRoleName };
+            _db.Roles.Add(role);
+            await _db.SaveChangesAsync();
+        }
+
+        var user = new AppUser
         {
             Email = req.Email,
             UserName = req.UserName,
-            FullName = req.FullName,
-            Phone = req.Phone
+            FullName = req.FullName ?? "",
+            Phone = req.Phone ?? "",
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow,
+            Roles = new List<Role> { role }
         };
         user.PasswordHash = _hasher.HashPassword(user, req.Password);
 
-        // mặc định role "User" nếu muốn: (tùy bước 4 seeding)
-        await _db.Users.AddAsync(user);
+        _db.Users.Add(user);
         await _db.SaveChangesAsync();
 
-        // phát token luôn
-        var (access, exp, jti) = _jwt.CreateAccessToken(user, roles: Array.Empty<string>());
-        var refresh = await SaveRefreshToken(user, jti);
-        return new AuthResponse(access, refresh.Token, exp);
+        var (accessToken, expiresAt) = _jwt.Generate(user, user.Roles.Select(r => r.Name));
+
+        var refresh = BuildRefreshToken(user.Id, ip);
+        _db.RefreshTokens.Add(refresh);
+        await _db.SaveChangesAsync();
+
+        return new AuthResponse(accessToken, refresh.Token, expiresAt);
     }
 
+    // ---------- Đăng nhập ----------
     public async Task<AuthResponse> LoginAsync(LoginRequest req, string? ip = null)
     {
-        var user = await _db.Users.Include(u => u.Roles).FirstOrDefaultAsync(x => x.Email == req.Email);
-        if (user is null) throw new UnauthorizedAccessException("Invalid credentials.");
+        var user = await _db.Users
+            .Include(u => u.Roles)
+            .FirstOrDefaultAsync(u => u.Email == req.Email);
 
-        var result = _hasher.VerifyHashedPassword(user, user.PasswordHash, req.Password);
-        if (result == PasswordVerificationResult.Failed)
-            throw new UnauthorizedAccessException("Invalid credentials.");
+        if (user == null)
+            throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
 
-        var roles = user.Roles.Select(r => r.Name);
-        var (access, exp, jti) = _jwt.CreateAccessToken(user, roles);
-        var refresh = await SaveRefreshToken(user, jti, ip);
+        var verify = _hasher.VerifyHashedPassword(user, user.PasswordHash!, req.Password);
+        if (verify == PasswordVerificationResult.Failed)
+            throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
 
-        return new AuthResponse(access, refresh.Token, exp);
+        var (accessToken, expiresAt) = _jwt.Generate(user, user.Roles.Select(r => r.Name));
+
+        var refresh = BuildRefreshToken(user.Id, ip);
+        _db.RefreshTokens.Add(refresh);
+        await _db.SaveChangesAsync();
+
+        return new AuthResponse(accessToken, refresh.Token, expiresAt);
     }
 
-    public async Task<AuthResponse> RefreshAsync(string refreshToken)
+    // ---------- Làm mới token ----------
+    public async Task<AuthResponse> RefreshAsync(string refreshToken, string? ip = null)
     {
-        var token = await _db.RefreshTokens.Include(r => r.User)
+        var token = await _db.RefreshTokens
+            .Include(t => t.User)
+            .ThenInclude(u => u!.Roles)
             .FirstOrDefaultAsync(t => t.Token == refreshToken);
 
-        if (token is null || token.RevokedAt != null || token.ExpiresAt < DateTime.UtcNow)
-            throw new UnauthorizedAccessException("Refresh token is invalid.");
+        if (token == null || token.RevokedAt != null || token.ExpiresAt <= DateTime.UtcNow)
+            throw new InvalidOperationException("Refresh token không hợp lệ hoặc đã hết hạn.");
 
-        // (tùy chọn) rotate: revoke token cũ
         token.RevokedAt = DateTime.UtcNow;
-        _db.RefreshTokens.Update(token);
 
         var user = token.User!;
-        var roles = user.Roles.Select(r => r.Name);
-        var (access, exp, jti) = _jwt.CreateAccessToken(user, roles);
-        var newRefresh = await SaveRefreshToken(user, jti);
+        var (accessToken, expiresAt) = _jwt.Generate(user, user.Roles.Select(r => r.Name));
+
+        var newRefresh = BuildRefreshToken(user.Id, ip);
+        _db.RefreshTokens.Add(newRefresh);
 
         await _db.SaveChangesAsync();
-        return new AuthResponse(access, newRefresh.Token, exp);
+
+        return new AuthResponse(accessToken, newRefresh.Token, expiresAt);
     }
 
-    public async Task LogoutAsync(string refreshToken)
+    // ---------- Đăng xuất ----------
+    public async Task LogoutAsync(string refreshToken, string? ip = null)
     {
         var token = await _db.RefreshTokens.FirstOrDefaultAsync(t => t.Token == refreshToken);
-        if (token != null)
-        {
-            token.RevokedAt = DateTime.UtcNow;
-            _db.RefreshTokens.Update(token);
-            await _db.SaveChangesAsync();
-        }
+        if (token == null) return;
+
+        token.RevokedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
     }
 
-    private async Task<RefreshToken> SaveRefreshToken(User user, string? jti, string? ip = null)
-    {
-        var days = int.Parse(_config["Jwt:RefreshTokenDays"] ?? "14");
-        var refresh = new RefreshToken
+    // ---------- Tạo RefreshToken ----------
+    private static RefreshToken BuildRefreshToken(Guid userId, string? ip)
+        => new()
         {
-            UserId = user.Id,
-            JwtId = jti,
-            Token = _jwt.CreateRefreshToken(),
-            ExpiresAt = DateTime.UtcNow.AddDays(days),
+            UserId = userId,
+            Token = Convert.ToBase64String(Guid.NewGuid().ToByteArray())
+                        .Replace("+", "").Replace("/", "").Replace("=", ""),
+            ExpiresAt = DateTime.UtcNow.AddDays(14),
+            CreatedAt = DateTime.UtcNow,
             CreatedByIp = ip
         };
-        await _db.RefreshTokens.AddAsync(refresh);
-        await _db.SaveChangesAsync();
-        return refresh;
-    }
 }
